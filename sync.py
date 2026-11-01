@@ -5,8 +5,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 from argparse import ArgumentParser, SUPPRESS
 from pathlib import Path
 
@@ -16,6 +18,7 @@ class SyncError(Exception):
 
 
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+PRIVATE_FILE_MODE = stat.S_IRUSR | stat.S_IWUSR
 
 
 def fail(message):
@@ -33,6 +36,8 @@ def load_config(config_path):
         fail(f"Config file not found: {config_path}")
     except json.JSONDecodeError as error:
         fail(f"Invalid JSON in {config_path}: {error}")
+    except UnicodeError as error:
+        fail(f"Could not decode config {config_path}: {error}")
     except OSError as error:
         fail(f"Could not read config {config_path}: {error}")
 
@@ -49,6 +54,8 @@ def validate_config(config):
     names = config["secrets"]
     if not isinstance(names, list):
         fail("'secrets' must be a list")
+    if not names:
+        fail("'secrets' must contain at least one name")
     if any(not isinstance(name, str) or not name.strip() for name in names):
         fail("'secrets' must contain non-empty strings")
     if any(not ENV_NAME_PATTERN.fullmatch(name) for name in names):
@@ -150,6 +157,8 @@ def load_secrets_from_file(secrets_path):
         raise SyncError(f"source file not found: {path}") from error
     except json.JSONDecodeError as error:
         raise SyncError(f"invalid JSON in {path}: {error}") from error
+    except UnicodeError as error:
+        raise SyncError(f"could not decode source {path}: {error}") from error
     except OSError as error:
         raise SyncError(f"could not read source {path}: {error}") from error
 
@@ -182,10 +191,64 @@ def approved_values(secrets, approved_names):
 
 
 def write_text(destination, content):
-    """Write a destination file, creating its parent directory when needed."""
+    """Atomically write a private destination file."""
     destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(content, encoding="utf-8")
+    temporary_path = None
+    file_descriptor = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", dir=str(destination.parent), text=True,
+        )
+        temporary_path = Path(temporary_name)
+        os.chmod(temporary_path, PRIVATE_FILE_MODE)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="") as output:
+            file_descriptor = None
+            output.write(content)
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    except (OSError, UnicodeError) as error:
+        raise SyncError(f"could not write destination {destination}: {error}") from error
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def write_private_temp_file(content):
+    """Write temporary text with private permissions and return its path."""
+    file_descriptor = None
+    temporary_path = None
+    try:
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix="secret-sync-", suffix=".json", text=True,
+        )
+        temporary_path = Path(temporary_name)
+        os.chmod(temporary_path, PRIVATE_FILE_MODE)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="") as output:
+            file_descriptor = None
+            output.write(content)
+        return temporary_path
+    except (OSError, UnicodeError) as error:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise SyncError(f"could not prepare AWS secret payload: {error}") from error
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
 
 
 def generate_env_file(secrets, approved_names, destination, dry_run=False):
@@ -234,7 +297,7 @@ def sync_to_aws(secrets, approved_names, secret_name, dry_run=False, region=None
                 profile=None, runner=None, aws_command="aws"):
     """Create or update one AWS Secrets Manager secret with selected values."""
     selected = approved_values(secrets, approved_names)
-    payload = json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
+    payload = json.dumps(selected, ensure_ascii=True, separators=(",", ":"))
     runner = runner or subprocess.run
 
     if dry_run:
@@ -250,25 +313,33 @@ def sync_to_aws(secrets, approved_names, secret_name, dry_run=False, region=None
             built.extend(["--profile", profile])
         return built
 
-    describe = run_aws(command("describe-secret", "--secret-id", secret_name), runner)
-    if describe.returncode == 0:
-        action = command(
-            "put-secret-value", "--secret-id", secret_name,
-            "--secret-string", payload,
-        )
-    elif "resourcenotfoundexception" in (describe.stderr or "").lower():
-        action = command(
-            "create-secret", "--name", secret_name,
-            "--secret-string", payload,
-        )
-    else:
-        raise SyncError(f"AWS Secrets Manager lookup failed for {secret_name!r}")
+    payload_path = write_private_temp_file(payload)
+    try:
+        payload_reference = f"file://{payload_path}"
+        describe = run_aws(command("describe-secret", "--secret-id", secret_name), runner)
+        if describe.returncode == 0:
+            action = command(
+                "put-secret-value", "--secret-id", secret_name,
+                "--secret-string", payload_reference,
+            )
+        elif "resourcenotfoundexception" in (describe.stderr or "").lower():
+            action = command(
+                "create-secret", "--name", secret_name,
+                "--secret-string", payload_reference,
+            )
+        else:
+            raise SyncError(f"AWS Secrets Manager lookup failed for {secret_name!r}")
 
-    result = run_aws(action, runner)
-    if result.returncode != 0:
-        raise SyncError(f"AWS Secrets Manager write failed for {secret_name!r}")
-    print(f"Synced {len(selected)} secrets to AWS Secrets Manager {secret_name}")
-    return True
+        result = run_aws(action, runner)
+        if result.returncode != 0:
+            raise SyncError(f"AWS Secrets Manager write failed for {secret_name!r}")
+        print(f"Synced {len(selected)} secrets to AWS Secrets Manager {secret_name}")
+        return True
+    finally:
+        try:
+            payload_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def run_secret_run_role(role, config_path, dry_run=False, secret_run_command=None,
@@ -296,7 +367,11 @@ def run_secret_run_role(role, config_path, dry_run=False, secret_run_command=Non
     ]
     if dry_run:
         command.append("--dry-run")
-    result = runner(command, check=False)
+    try:
+        result = runner(command, check=False)
+    except OSError as error:
+        print(f"Error: could not start secret-run: {error}", file=sys.stderr)
+        return 1
     if result.returncode != 0:
         print(f"Error: secret-run failed with exit code {result.returncode}", file=sys.stderr)
     return result.returncode
