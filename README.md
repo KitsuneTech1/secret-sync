@@ -27,6 +27,8 @@ Create a JSON file with the names to copy and the destination:
 }
 ```
 
+JSON files may be saved as UTF-8 with or without a byte order mark.
+
 The names must be unique, non-empty environment variable names using letters,
 digits, and underscores, with a letter or underscore first. A dotenv destination
 is replaced with the selected entries on each non-dry run. Missing names are

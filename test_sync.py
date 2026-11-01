@@ -53,6 +53,12 @@ class TestSecretSync(unittest.TestCase):
         self.assertIn('secrets', config)
         self.assertIn('destination', config)
 
+    def test_load_config_accepts_utf8_bom(self):
+        """Test loading config saved with a Windows UTF-8 BOM."""
+        self.config_path.write_bytes(b'\xef\xbb\xbf' + json.dumps(self.config).encode('utf-8'))
+        config = sync.load_config(self.config_path)
+        self.assertEqual(config['secrets'], ['API_KEY', 'DB_PASSWORD'])
+
     def test_validate_config_valid(self):
         """Test validation of valid config."""
         config = {"secrets": ["KEY1"], "destination": "/tmp/test"}
@@ -96,6 +102,12 @@ class TestSecretSync(unittest.TestCase):
         """Test loading secrets from JSON file."""
         secrets = sync.load_secrets_from_file(self.source_path)
         self.assertIn('API_KEY', secrets)
+        self.assertEqual(secrets['API_KEY'], 'secret-api-key-123')
+
+    def test_load_secrets_from_json_accepts_utf8_bom(self):
+        """Test loading JSON secrets saved with a Windows UTF-8 BOM."""
+        self.source_path.write_bytes(b'\xef\xbb\xbf' + json.dumps(self.source_secrets).encode('utf-8'))
+        secrets = sync.load_secrets_from_file(self.source_path)
         self.assertEqual(secrets['API_KEY'], 'secret-api-key-123')
 
     def test_load_secrets_from_env_variant(self):

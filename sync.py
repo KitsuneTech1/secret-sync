@@ -27,7 +27,7 @@ def fail(message):
 def load_config(config_path):
     """Load a JSON sync configuration file."""
     try:
-        with open(config_path, "r", encoding="utf-8") as config_file:
+        with open(config_path, "r", encoding="utf-8-sig") as config_file:
             return json.load(config_file)
     except FileNotFoundError:
         fail(f"Config file not found: {config_path}")
@@ -122,7 +122,7 @@ def load_secrets_from_file(secrets_path):
     path = Path(secrets_path)
     try:
         if path.suffix.lower() == ".json":
-            with open(path, "r", encoding="utf-8") as source_file:
+            with open(path, "r", encoding="utf-8-sig") as source_file:
                 secrets = json.load(source_file)
             if not isinstance(secrets, dict):
                 raise SyncError("JSON source must contain an object")
