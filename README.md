@@ -29,10 +29,11 @@ Create a JSON file with the names to copy and the destination:
 
 JSON files may be saved as UTF-8 with or without a byte order mark.
 
-The names must be unique, non-empty environment variable names using letters,
-digits, and underscores, with a letter or underscore first. A dotenv destination
-is replaced with the selected entries on each non-dry run. Missing names are
-reported, and the command fails if none of the approved names are present.
+The list must contain at least one name. Names must be unique, non-empty
+environment variable names using letters, digits, and underscores, with a
+letter or underscore first. A dotenv destination is replaced with the selected
+entries on each non-dry run. Missing names are reported, and the command fails
+if none of the approved names are present.
 
 For AWS Secrets Manager, use an object destination:
 
@@ -117,9 +118,10 @@ ignored.
 ## AWS behavior
 
 AWS mode calls the AWS CLI `secretsmanager` commands. It captures CLI output so
-secret values are not printed by this tool. If the AWS CLI is missing, the
-command exits with a message that explains how to use a dotenv destination
-instead.
+secret values are not printed by this tool. The payload is passed through a
+short-lived private temporary file so it is not included in the AWS CLI command
+arguments. If the AWS CLI is missing, the command exits with a message that
+explains how to use a dotenv destination instead.
 
 AWS credentials and permissions are supplied by the normal AWS CLI
 configuration. Tests do not contact AWS.

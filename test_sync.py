@@ -3,8 +3,10 @@
 
 import unittest
 import json
+import os
 import shutil
-import subprocess
+import stat
+import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
@@ -16,8 +18,8 @@ class TestSecretSync(unittest.TestCase):
 
     def setUp(self):
         """Create temporary files for testing."""
-        self.temp_dir = Path.cwd() / '.test-fixture'
-        self.temp_dir.mkdir(exist_ok=True)
+        self.temp_dir = Path.cwd() / (".scratch-" + uuid.uuid4().hex)
+        self.temp_dir.mkdir()
 
         # Create config file
         self.config = {
@@ -40,12 +42,7 @@ class TestSecretSync(unittest.TestCase):
 
     def tearDown(self):
         """Remove the test fixture directory from the workspace."""
-        for child in self.temp_dir.iterdir():
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-        self.temp_dir.rmdir()
+        shutil.rmtree(self.temp_dir)
 
     def test_load_config(self):
         """Test loading configuration."""
@@ -59,11 +56,21 @@ class TestSecretSync(unittest.TestCase):
         config = sync.load_config(self.config_path)
         self.assertEqual(config['secrets'], ['API_KEY', 'DB_PASSWORD'])
 
+    def test_load_config_rejects_invalid_utf8(self):
+        """Test invalid config encoding is reported without a traceback."""
+        self.config_path.write_bytes(b'\xff')
+        with self.assertRaises(SystemExit):
+            sync.load_config(self.config_path)
+
     def test_validate_config_valid(self):
         """Test validation of valid config."""
-        config = {"secrets": ["KEY1"], "destination": "/tmp/test"}
-        # Should not raise
+        config = {"secrets": ["KEY1"], "destination": str(self.temp_dir / "output.env")}
         sync.validate_config(config)
+
+    def test_validate_config_rejects_empty_allowlist(self):
+        """Test validation rejects a config that cannot select any secret."""
+        with self.assertRaises(SystemExit):
+            sync.validate_config({"secrets": [], "destination": ".env"})
 
     def test_validate_aws_destination(self):
         """Test validation of an AWS Secrets Manager destination."""
@@ -110,6 +117,12 @@ class TestSecretSync(unittest.TestCase):
         secrets = sync.load_secrets_from_file(self.source_path)
         self.assertEqual(secrets['API_KEY'], 'secret-api-key-123')
 
+    def test_load_secrets_from_file_rejects_invalid_utf8(self):
+        """Test invalid source encoding is reported without a traceback."""
+        self.source_path.write_bytes(b'\xff')
+        with self.assertRaisesRegex(sync.SyncError, 'could not decode source'):
+            sync.load_secrets_from_file(self.source_path)
+
     def test_load_secrets_from_env_variant(self):
         """Test loading a conventional .env.production file."""
         source = self.temp_dir / '.env.production'
@@ -154,6 +167,31 @@ class TestSecretSync(unittest.TestCase):
         sync.generate_env_file(secrets, ['API_KEY'], output, dry_run=True)
 
         self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file modes are not portable to this platform")
+    def test_generated_secret_file_is_owner_only(self):
+        """Test generated secret files are not group- or world-readable."""
+        output = self.temp_dir / '.env.private'
+        sync.generate_env_file({'API_KEY': 'key123'}, ['API_KEY'], output)
+
+        self.assertEqual(
+            stat.S_IMODE(output.stat().st_mode),
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+
+    def test_destination_write_failure_is_reported_as_sync_error(self):
+        """Test a directory destination produces a user-facing sync error."""
+        with self.assertRaisesRegex(sync.SyncError, 'could not write destination'):
+            sync.generate_env_file(
+                {'API_KEY': 'key123'}, ['API_KEY'], self.temp_dir,
+            )
+
+    def test_destination_encoding_failure_is_reported_as_sync_error(self):
+        """Test an unencodable value does not escape as a Unicode traceback."""
+        with self.assertRaisesRegex(sync.SyncError, 'could not write destination'):
+            sync.generate_env_file(
+                {'API_KEY': '\ud800'}, ['API_KEY'], self.temp_dir / '.env.bad',
+            )
 
     def test_generate_stub_file(self):
         """Test generating stub file."""
@@ -235,7 +273,34 @@ class TestSecretSync(unittest.TestCase):
         describe, create = [call.args[0] for call in runner.call_args_list]
         self.assertEqual(describe[:3], ['aws', 'secretsmanager', 'describe-secret'])
         self.assertIn('create-secret', create)
-        self.assertEqual(create[create.index('--secret-string') + 1], '{"API_KEY":"key123"}')
+        payload_reference = create[create.index('--secret-string') + 1]
+        self.assertTrue(payload_reference.startswith('file://'))
+        self.assertFalse(payload_reference.endswith('{"API_KEY":"key123"}'))
+
+    def test_aws_sync_does_not_put_secret_value_in_cli_arguments(self):
+        """Test AWS payloads are supplied through a temporary file, not argv."""
+        commands = []
+        payload_paths = []
+
+        def runner(command, **kwargs):
+            commands.append(command)
+            if '--secret-string' in command:
+                payload_reference = command[command.index('--secret-string') + 1]
+                self.assertTrue(payload_reference.startswith('file://'))
+                payload_path = Path(payload_reference[len('file://'):])
+                payload_paths.append(payload_path)
+                self.assertTrue(payload_path.exists())
+                self.assertEqual(json.loads(payload_path.read_text()), {'API_KEY': 'key123'})
+                self.assertNotIn('key123', ' '.join(command))
+            return SimpleNamespace(returncode=0, stderr='', stdout='')
+
+        sync.sync_to_aws(
+            {'API_KEY': 'key123'}, ['API_KEY'], 'app/config', runner=runner,
+        )
+
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(len(payload_paths), 1)
+        self.assertFalse(payload_paths[0].exists())
 
     def test_aws_sync_updates_existing_secret(self):
         """Test AWS sync updates an existing secret with the selected values."""
@@ -249,7 +314,9 @@ class TestSecretSync(unittest.TestCase):
         )
         update = runner.call_args_list[1].args[0]
         self.assertIn('put-secret-value', update)
-        self.assertEqual(update[update.index('--secret-string') + 1], '{"API_KEY":"key123"}')
+        payload_reference = update[update.index('--secret-string') + 1]
+        self.assertTrue(payload_reference.startswith('file://'))
+        self.assertNotIn('key123', ' '.join(update))
 
     def test_aws_missing_cli_has_clear_error(self):
         """Test a missing optional AWS CLI reports an actionable error."""
@@ -283,6 +350,19 @@ class TestSecretSync(unittest.TestCase):
                 ),
                 7,
             )
+
+    def test_secret_run_role_launch_failure_returns_exit_code(self):
+        """Test an OS-level secret-run launch failure is reported, not raised."""
+        def failing_runner(command, **kwargs):
+            raise OSError('launch failed')
+
+        self.assertEqual(
+            sync.run_secret_run_role(
+                'production', self.config_path,
+                secret_run_command='secret-run', runner=failing_runner,
+            ),
+            1,
+        )
 
 
 if __name__ == '__main__':
