@@ -73,6 +73,13 @@ class TestSecretSync(unittest.TestCase):
         with self.assertRaises(SystemExit):
             sync.validate_config({"secrets": ["KEY1", 2], "destination": ".env"})
 
+    def test_validate_config_rejects_names_that_break_dotenv_output(self):
+        """Test names are safe for dotenv and secret-run environment output."""
+        for name in ("1KEY", "KEY-NAME", "KEY NAME", "KEY=VALUE", "KEY\nINJECTED"):
+            with self.subTest(name=name):
+                with self.assertRaises(SystemExit):
+                    sync.validate_config({"secrets": [name], "destination": ".env"})
+
     def test_validate_config_missing_secrets(self):
         """Test validation fails with missing secrets key."""
         config = {"destination": "/tmp/test"}

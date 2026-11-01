@@ -27,9 +27,10 @@ Create a JSON file with the names to copy and the destination:
 }
 ```
 
-The names must be unique, non-empty strings. A dotenv destination is replaced
-with the selected entries on each non-dry run. Missing names are reported, and
-the command fails if none of the approved names are present.
+The names must be unique, non-empty environment variable names using letters,
+digits, and underscores, with a letter or underscore first. A dotenv destination
+is replaced with the selected entries on each non-dry run. Missing names are
+reported, and the command fails if none of the approved names are present.
 
 For AWS Secrets Manager, use an object destination:
 
