@@ -1,100 +1,98 @@
 # secret-sync
 
-Move an approved set of secrets one way between approved places with a dry run option.
+`secret-sync` copies an allowlisted set of secret values in one direction. It
+can read local JSON or dotenv files, or run under `secret-run` to receive
+selected Proton Pass items. It writes either a dotenv file or one AWS Secrets
+Manager secret. `--dry-run` shows the names and destination without writing.
 
-## What it does
+There are no bidirectional writes.
 
-Syncs a defined list of secrets from a source file (JSON or .env) to a destination, ensuring only approved secrets are transferred. Supports:
+## Requirements
 
-- JSON or .env format source files
-- Whitelist-based secret filtering
-- Dry run mode to preview sync without writing
-- Stub mode to generate placeholder files
+- Python 3.8 or newer
+- `secret-run` on `PATH` for Proton Pass input
+- AWS CLI on `PATH` for an AWS Secrets Manager destination
 
-No bidirectional writes. One-way only.
+The local-file mode only uses the Python standard library. No package
+installation is required.
 
-## Installation
+## Configuration
 
-```bash
-pip install -e .
-```
-
-Or run directly:
-
-```bash
-python sync.py <config.json> [options]
-```
-
-## Usage
-
-### Configuration file
-
-Create a JSON configuration file that specifies which secrets to sync:
+Create a JSON file with the names to copy and the destination:
 
 ```json
 {
-  "secrets": ["API_KEY", "DB_PASSWORD", "SLACK_TOKEN"],
-  "destination": ".env"
+  "secrets": ["API_KEY", "DB_PASSWORD"],
+  "destination": ".env.local"
 }
 ```
 
-### Sync from JSON source
+The names must be unique, non-empty strings. A dotenv destination is replaced
+with the selected entries on each non-dry run. Missing names are reported, and
+the command fails if none of the approved names are present.
+
+For AWS Secrets Manager, use an object destination:
+
+```json
+{
+  "secrets": ["API_KEY", "DB_PASSWORD"],
+  "destination": {
+    "type": "aws-secrets-manager",
+    "name": "my-app/config",
+    "region": "us-east-1"
+  }
+}
+```
+
+`region` and `profile` are optional. The AWS secret value is a JSON object
+containing only the selected names. An existing secret gets a new version. A
+missing secret is created.
+
+## Usage
+
+Run from a local JSON source:
 
 ```bash
 python sync.py config.json --source secrets.json
 ```
 
-This reads all secrets from secrets.json and syncs only the approved ones to .env.
-
-### Sync from .env source
+Run from a dotenv source:
 
 ```bash
 python sync.py config.json --source .env.production
 ```
 
-Parses the source .env file and syncs approved entries.
+Run with Proton Pass through `secret-run`:
 
-### Dry run (preview without writing)
+```bash
+python sync.py config.json --role production
+```
+
+The `production` role must map the configured names to Proton Pass items. For
+example, `API_KEY = My API key` in the role file provides the `API_KEY` value.
+`secret-run` starts a child sync process with the values in its environment.
+`secret-sync` does not print those values.
+
+Preview any source without writing:
 
 ```bash
 python sync.py config.json --source secrets.json --dry-run
+python sync.py config.json --role production --dry-run
 ```
 
-Prints what would be synced without actually writing the file.
-
-### Generate stub file (no values)
+Generate a placeholder dotenv file without reading secrets:
 
 ```bash
 python sync.py config.json --stub
 ```
 
-Creates a .env file with placeholder values (all set to "CHANGE_ME") for the approved secrets. Useful for sharing configuration templates.
+`--stub` requires a dotenv path destination. It writes `CHANGE_ME` for every
+approved name.
 
-### Combine options
+## Source formats
 
-```bash
-python sync.py config.json --source secrets.json --dry-run --stub
-```
+JSON sources contain an object:
 
-## Config file format
-
-```json
-{
-  "secrets": [
-    "API_KEY",
-    "DATABASE_URL",
-    "SIGNING_KEY"
-  ],
-  "destination": ".env.local"
-}
-```
-
-- secrets: list of secret names to approve for syncing
-- destination: output file path (any format, typically .env)
-
-## Source file formats
-
-JSON:
 ```json
 {
   "API_KEY": "actual-key-value",
@@ -102,24 +100,35 @@ JSON:
 }
 ```
 
-.env:
-```
-API_KEY=actual-key-value
+Dotenv sources support comments, `export NAME=value`, quoted values, and a
+single `=` separator:
+
+```dotenv
+API_KEY="actual-key-value"
 DB_PASSWORD=actual-password
 ```
 
-## Security
+Only names listed in the configuration are copied. Extra source values are
+ignored.
 
-- Only approved secrets (listed in config) are synced
-- Actual secret values are never logged or printed unless explicitly requested
-- Dry run mode lets you review exactly what will be written before committing
-- Stub mode (--stub) removes all actual values and replaces with placeholders
+## AWS behavior
+
+AWS mode calls the AWS CLI `secretsmanager` commands. It captures CLI output so
+secret values are not printed by this tool. If the AWS CLI is missing, the
+command exits with a message that explains how to use a dotenv destination
+instead.
+
+AWS credentials and permissions are supplied by the normal AWS CLI
+configuration. Tests do not contact AWS.
 
 ## Testing
 
 ```bash
-python -m unittest test_sync
+python -m unittest -v
 ```
+
+The test suite uses local fixtures and mocked subprocess calls. It does not
+contact Proton Pass, AWS, or any other network service.
 
 ## License
 
