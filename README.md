@@ -1,27 +1,31 @@
 <p align="center"><a href="https://kitsunetechnologies.org/work"><img src="https://raw.githubusercontent.com/KitsuneTech1/.github/main/assets/kitsune-banner.svg" alt="Built by Kitsune Technologies" width="760"></a></p>
 
-# secret-sync
+# Secret Bridge
 
-`secret-sync` copies an allowlisted set of secret values in one direction. It
+One-way secret synchronization from JSON, dotenv, or Proton Pass to .env or AWS Secrets Manager.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](#requirements)
+
+Secret Bridge copies an allowlisted set of secret values in one direction. It
 can read local JSON or dotenv files, or run under `secret-run` to receive
 selected Proton Pass items. It writes either a dotenv file or one AWS Secrets
-Manager secret. `--dry-run` shows the names and destination without writing.
+Manager secret. `--dry-run` shows what would be written without making changes.
 
 There are no bidirectional writes.
 
 ## Requirements
 
 - Python 3.8 or newer
-- `secret-run` on `PATH` for Proton Pass input
-- AWS CLI on `PATH` for an AWS Secrets Manager destination
+- `secret-run` on `PATH` (for Proton Pass input only)
+- AWS CLI on `PATH` (for AWS Secrets Manager destination only)
 
-The local-file mode only uses the Python standard library. No package
-installation is required.
+Local file mode uses only the Python standard library, so no packages need installing for that.
 
-## Configuration
+## Quick start
 
-Create a JSON file with the names to copy and the destination:
+Create a config file with the secrets to copy and where they go:
 
+**For dotenv output:**
 ```json
 {
   "secrets": ["API_KEY", "DB_PASSWORD"],
@@ -29,16 +33,7 @@ Create a JSON file with the names to copy and the destination:
 }
 ```
 
-JSON files may be saved as UTF-8 with or without a byte order mark.
-
-The list must contain at least one name. Names must be unique, non-empty
-environment variable names using letters, digits, and underscores, with a
-letter or underscore first. A dotenv destination is replaced with the selected
-entries on each non-dry run. Missing names are reported, and the command fails
-if none of the approved names are present.
-
-For AWS Secrets Manager, use an object destination:
-
+**For AWS Secrets Manager:**
 ```json
 {
   "secrets": ["API_KEY", "DB_PASSWORD"],
@@ -50,55 +45,48 @@ For AWS Secrets Manager, use an object destination:
 }
 ```
 
-`region` and `profile` are optional. The AWS secret value is a JSON object
-containing only the selected names. An existing secret gets a new version. A
-missing secret is created.
-
-## Usage
-
-Run from a local JSON source:
+Then sync from a local file or Proton Pass:
 
 ```bash
+# From JSON source
 python sync.py config.json --source secrets.json
-```
 
-Run from a dotenv source:
-
-```bash
+# From dotenv source
 python sync.py config.json --source .env.production
-```
 
-Run with Proton Pass through `secret-run`:
-
-```bash
+# From Proton Pass (via secret-run)
 python sync.py config.json --role production
-```
 
-The `production` role must map the configured names to Proton Pass items. For
-example, `API_KEY = My API key` in the role file provides the `API_KEY` value.
-`secret-run` starts a child sync process with the values in its environment.
-`secret-sync` does not print those values.
-
-Preview any source without writing:
-
-```bash
+# Dry-run any of the above
 python sync.py config.json --source secrets.json --dry-run
-python sync.py config.json --role production --dry-run
-```
 
-Generate a placeholder dotenv file without reading secrets:
-
-```bash
+# Generate a stub .env file
 python sync.py config.json --stub
 ```
 
-`--stub` requires a dotenv path destination. It writes `CHANGE_ME` for every
-approved name.
+## Configuration details
+
+Secret names must be unique, non-empty environment variable names using letters, digits, and underscores, with a letter or underscore first. At least one name is required.
+
+JSON config files may be UTF-8 with or without a byte order mark.
+
+For dotenv destinations, the file is replaced on each run with only the selected secrets. Missing names are warned but don't fail if at least one is found.
+
+For AWS Secrets Manager, `region` and `profile` are optional. The secret value becomes a JSON object with the selected names. Existing secrets get a new version, missing ones are created.
+
+## How it works
+
+**Local sources** read JSON or dotenv files directly. Only names in the allowlist are copied.
+
+**Proton Pass input** runs under `secret-run`, which must map role names to Proton Pass items (e.g., `API_KEY = My API key`). Secret Bridge runs as a child process with those values in its environment, so they never appear in logs or command-line output.
+
+**Dotenv output** writes a single `.env*` file with quoted values and escape sequences handled.
+
+**AWS Secrets Manager output** writes a JSON object containing only the selected names. The payload passes through a short-lived temporary file, never appearing in CLI arguments. Existing secrets get a new version, missing ones are created.
 
 ## Source formats
 
-JSON sources contain an object:
-
+JSON sources are simple objects:
 ```json
 {
   "API_KEY": "actual-key-value",
@@ -106,36 +94,23 @@ JSON sources contain an object:
 }
 ```
 
-Dotenv sources support comments, `export NAME=value`, quoted values, and a
-single `=` separator:
-
+Dotenv sources support comments, `export`, quoted values, and inline comments:
 ```dotenv
 API_KEY="actual-key-value"
 DB_PASSWORD=actual-password
+# UNUSED_KEY="ignored"
+export SECRET="also works"
 ```
 
-Only names listed in the configuration are copied. Extra source values are
-ignored.
-
-## AWS behavior
-
-AWS mode calls the AWS CLI `secretsmanager` commands. It captures CLI output so
-secret values are not printed by this tool. The payload is passed through a
-short-lived private temporary file so it is not included in the AWS CLI command
-arguments. If the AWS CLI is missing, the command exits with a message that
-explains how to use a dotenv destination instead.
-
-AWS credentials and permissions are supplied by the normal AWS CLI
-configuration. Tests do not contact AWS.
+Only names in your allowlist are copied. Extra values in the source are ignored.
 
 ## Testing
 
 ```bash
-python -m unittest -v
+python -m unittest
 ```
 
-The test suite uses local fixtures and mocked subprocess calls. It does not
-contact Proton Pass, AWS, or any other network service.
+The suite covers 36 cases: config validation, file I/O, dotenv parsing, AWS CLI mocking, and Proton Pass integration. It uses fixtures and mocked subprocess calls, so no network or external tools are needed.
 
 ## License
 
