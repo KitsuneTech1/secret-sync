@@ -2,8 +2,11 @@
 """Tests for secret-sync."""
 
 import unittest
-import tempfile
 import json
+import shutil
+import subprocess
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 import sync
 
@@ -13,7 +16,8 @@ class TestSecretSync(unittest.TestCase):
 
     def setUp(self):
         """Create temporary files for testing."""
-        self.temp_dir = Path(tempfile.mkdtemp())
+        self.temp_dir = Path.cwd() / '.test-fixture'
+        self.temp_dir.mkdir(exist_ok=True)
 
         # Create config file
         self.config = {
@@ -34,6 +38,15 @@ class TestSecretSync(unittest.TestCase):
         with open(self.source_path, 'w') as f:
             json.dump(self.source_secrets, f)
 
+    def tearDown(self):
+        """Remove the test fixture directory from the workspace."""
+        for child in self.temp_dir.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        self.temp_dir.rmdir()
+
     def test_load_config(self):
         """Test loading configuration."""
         config = sync.load_config(self.config_path)
@@ -45,6 +58,20 @@ class TestSecretSync(unittest.TestCase):
         config = {"secrets": ["KEY1"], "destination": "/tmp/test"}
         # Should not raise
         sync.validate_config(config)
+
+    def test_validate_aws_destination(self):
+        """Test validation of an AWS Secrets Manager destination."""
+        sync.validate_config({
+            "secrets": ["KEY1"],
+            "destination": {"type": "aws-secrets-manager", "name": "app/config"},
+        })
+
+    def test_validate_config_rejects_invalid_secret_names(self):
+        """Test validation rejects empty and non-string secret names."""
+        with self.assertRaises(SystemExit):
+            sync.validate_config({"secrets": ["KEY1", ""], "destination": ".env"})
+        with self.assertRaises(SystemExit):
+            sync.validate_config({"secrets": ["KEY1", 2], "destination": ".env"})
 
     def test_validate_config_missing_secrets(self):
         """Test validation fails with missing secrets key."""
@@ -64,6 +91,15 @@ class TestSecretSync(unittest.TestCase):
         self.assertIn('API_KEY', secrets)
         self.assertEqual(secrets['API_KEY'], 'secret-api-key-123')
 
+    def test_load_secrets_from_env_variant(self):
+        """Test loading a conventional .env.production file."""
+        source = self.temp_dir / '.env.production'
+        source.write_text('export API_KEY="key 123" # inline comment\nDB_PASSWORD=pass456 # comment\n')
+        self.assertEqual(
+            sync.load_secrets_from_file(source),
+            {"API_KEY": "key 123", "DB_PASSWORD": "pass456"},
+        )
+
     def test_format_env_entry(self):
         """Test formatting environment variable entry."""
         entry = sync.format_env_entry('TEST_KEY', 'test_value')
@@ -73,6 +109,11 @@ class TestSecretSync(unittest.TestCase):
         """Test formatting with quotes in value."""
         entry = sync.format_env_entry('KEY', 'value"with"quotes')
         self.assertIn('\\"', entry)
+
+    def test_format_env_entry_escapes_newlines(self):
+        """Test formatting keeps multiline values on one dotenv line."""
+        self.assertEqual(sync.format_env_entry('KEY', 'line1\nline2'),
+                         'KEY="line1\\nline2"')
 
     def test_generate_env_file(self):
         """Test generating env file with actual secrets."""
@@ -113,6 +154,20 @@ class TestSecretSync(unittest.TestCase):
 
         self.assertFalse(output.exists())
 
+    def test_main_runs_local_source_sync(self):
+        """Test the CLI entry point completes a local source sync."""
+        destination = self.temp_dir / '.env.from-main'
+        config = self.temp_dir / 'main-config.json'
+        config.write_text(json.dumps({
+            'secrets': ['API_KEY'],
+            'destination': str(destination),
+        }))
+        source = self.temp_dir / 'main-secrets.json'
+        source.write_text(json.dumps({'API_KEY': 'key123', 'OTHER': 'ignored'}))
+
+        self.assertEqual(sync.main([str(config), '--source', str(source)]), 0)
+        self.assertEqual(destination.read_text(), 'API_KEY="key123"\n')
+
     def test_only_approved_secrets_sync(self):
         """Test that only approved secrets are synced."""
         secrets = {
@@ -127,6 +182,88 @@ class TestSecretSync(unittest.TestCase):
         self.assertIn('APPROVED_1', content)
         self.assertIn('APPROVED_2', content)
         self.assertNotIn('NOT_APPROVED', content)
+
+    def test_load_secrets_from_environment(self):
+        """Test reading only the approved names from a secret-run environment."""
+        with patch.dict('os.environ', {'API_KEY': 'key123', 'OTHER': 'do-not-read'}, clear=True):
+            self.assertEqual(sync.load_secrets_from_environment(['API_KEY']),
+                             {'API_KEY': 'key123'})
+
+    def test_load_secrets_from_environment_requires_each_name(self):
+        """Test a missing injected secret fails without writing anything."""
+        with patch.dict('os.environ', {}, clear=True):
+            with self.assertRaises(sync.SyncError):
+                sync.load_secrets_from_environment(['API_KEY'])
+
+    def test_aws_dry_run_does_not_call_cli(self):
+        """Test AWS dry-run reports names without invoking AWS CLI."""
+        runner = unittest.mock.Mock()
+        sync.sync_to_aws(
+            {'API_KEY': 'key123'}, ['API_KEY'], 'app/config', dry_run=True,
+            runner=runner,
+        )
+        runner.assert_not_called()
+
+    def test_aws_sync_creates_missing_secret(self):
+        """Test AWS sync creates a secret when describe reports it missing."""
+        runner = unittest.mock.Mock(side_effect=[
+            SimpleNamespace(returncode=1, stderr='ResourceNotFoundException', stdout=''),
+            SimpleNamespace(returncode=0, stderr='', stdout=''),
+        ])
+        sync.sync_to_aws(
+            {'API_KEY': 'key123'}, ['API_KEY'], 'app/config', runner=runner,
+        )
+        describe, create = [call.args[0] for call in runner.call_args_list]
+        self.assertEqual(describe[:3], ['aws', 'secretsmanager', 'describe-secret'])
+        self.assertIn('create-secret', create)
+        self.assertEqual(create[create.index('--secret-string') + 1], '{"API_KEY":"key123"}')
+
+    def test_aws_sync_updates_existing_secret(self):
+        """Test AWS sync updates an existing secret with the selected values."""
+        runner = unittest.mock.Mock(side_effect=[
+            SimpleNamespace(returncode=0, stderr='', stdout=''),
+            SimpleNamespace(returncode=0, stderr='', stdout=''),
+        ])
+        sync.sync_to_aws(
+            {'API_KEY': 'key123', 'OTHER': 'ignored'}, ['API_KEY'], 'app/config',
+            runner=runner,
+        )
+        update = runner.call_args_list[1].args[0]
+        self.assertIn('put-secret-value', update)
+        self.assertEqual(update[update.index('--secret-string') + 1], '{"API_KEY":"key123"}')
+
+    def test_aws_missing_cli_has_clear_error(self):
+        """Test a missing optional AWS CLI reports an actionable error."""
+        runner = unittest.mock.Mock(side_effect=FileNotFoundError())
+        with self.assertRaisesRegex(sync.SyncError, 'AWS CLI was not found'):
+            sync.sync_to_aws(
+                {'API_KEY': 'key123'}, ['API_KEY'], 'app/config', runner=runner,
+            )
+
+    def test_secret_run_role_dispatch_does_not_include_values(self):
+        """Test role dispatch delegates to secret-run without exposing values."""
+        result = SimpleNamespace(returncode=0)
+        with patch.object(sync.subprocess, 'run', return_value=result) as runner:
+            exit_code = sync.run_secret_run_role(
+                'production', self.config_path, dry_run=True,
+                secret_run_command='secret-run',
+            )
+        self.assertEqual(exit_code, 0)
+        command = runner.call_args.args[0]
+        self.assertIn('--source-env', command)
+        self.assertNotIn('secret-api-key-123', command)
+        self.assertNotIn('super-secret-password', command)
+
+    def test_secret_run_role_failure_returns_exit_code(self):
+        """Test a failed secret-run child is reported to the caller."""
+        with patch.object(sync.subprocess, 'run', return_value=SimpleNamespace(returncode=7)):
+            self.assertEqual(
+                sync.run_secret_run_role(
+                    'production', self.config_path,
+                    secret_run_command='secret-run',
+                ),
+                7,
+            )
 
 
 if __name__ == '__main__':
