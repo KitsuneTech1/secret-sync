@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,9 @@ from pathlib import Path
 
 class SyncError(Exception):
     """A user-facing sync failure that should not expose secret values."""
+
+
+ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def fail(message):
@@ -47,6 +51,8 @@ def validate_config(config):
         fail("'secrets' must be a list")
     if any(not isinstance(name, str) or not name.strip() for name in names):
         fail("'secrets' must contain non-empty strings")
+    if any(not ENV_NAME_PATTERN.fullmatch(name) for name in names):
+        fail("'secrets' must contain valid environment variable names")
     if len(set(names)) != len(names):
         fail("'secrets' must not contain duplicates")
 
