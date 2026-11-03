@@ -4,6 +4,7 @@
 
 One-way secret synchronization from JSON, dotenv, or Proton Pass to .env or AWS Secrets Manager.
 
+[![Build Status](https://github.com/KitsuneTech1/secret-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/KitsuneTech1/secret-sync/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](#requirements)
 
 Secret Bridge copies an allowlisted set of secret values in one direction. It
@@ -20,6 +21,17 @@ There are no bidirectional writes.
 - AWS CLI on `PATH` (for AWS Secrets Manager destination only)
 
 Local file mode uses only the Python standard library, so no packages need installing for that.
+
+
+## Architecture & Data Flow
+
+```mermaid
+flowchart LR
+    A[Source: Proton Pass / JSON / Dotenv] --> B[Allowlist Verification & Secret Validation]
+    B --> C[One-Way Secret Synchronization Engine]
+    C --> D[Target: Local .env or AWS Secrets Manager]
+    D --> E[Zero-Leak Audit Logging]
+```
 
 ## Quick start
 
